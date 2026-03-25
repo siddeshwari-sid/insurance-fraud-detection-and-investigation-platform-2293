@@ -1,254 +1,303 @@
-const { createSupabaseServiceClient } = require('../db/supabase');
+const crypto = require('crypto');
 const { notFound, badRequest } = require('../middleware/errors');
 
-function sb() {
-  return createSupabaseServiceClient();
+/**
+ * In-memory datastore (MVP)
+ * -------------------------
+ * This module intentionally stores everything in process memory:
+ * - claims
+ * - fraud signals
+ * - cases (1:1 with claim)
+ * - outcomes (history; latest used for views)
+ *
+ * NOTE: Data will be lost on server restart and is not shared across instances.
+ */
+
+// Maps keyed by id
+const claimsById = new Map(); // claimId -> claim row
+const signalsByClaimId = new Map(); // claimId -> FraudSignal[]
+const casesByClaimId = new Map(); // claimId -> case row
+const outcomesByClaimId = new Map(); // claimId -> Outcome[] (history)
+
+function uuid() {
+  // Node 18+ supports randomUUID; fallback to crypto for safety.
+  return crypto.randomUUID ? crypto.randomUUID() : crypto.randomBytes(16).toString('hex');
 }
 
-function mapClaimRow(row) {
-  return row;
+function toIsoDateTime(d) {
+  if (!d) return new Date().toISOString();
+  if (d instanceof Date) return d.toISOString();
+  const parsed = new Date(d);
+  return Number.isNaN(parsed.getTime()) ? new Date().toISOString() : parsed.toISOString();
+}
+
+function toIsoDateOnly(d) {
+  if (!d) return null;
+  if (d instanceof Date) return d.toISOString().slice(0, 10);
+  const parsed = new Date(d);
+  if (Number.isNaN(parsed.getTime())) return null;
+  return parsed.toISOString().slice(0, 10);
+}
+
+function computePriority(riskBand) {
+  return riskBand === 'high' ? 3 : riskBand === 'medium' ? 1 : 0;
+}
+
+function withRiskPct(claim) {
+  const raw = claim && claim.risk_score !== undefined && claim.risk_score !== null ? Number(claim.risk_score) : null;
+  const risk_score_pct = raw === null || Number.isNaN(raw) ? null : Math.round(raw * 100);
+  return { ...claim, risk_score_pct };
+}
+
+function latestOutcomeForClaim(claimId) {
+  const arr = outcomesByClaimId.get(claimId) || [];
+  if (!arr.length) return null;
+  // ISO8601 string compare is safe lexicographically.
+  return [...arr].sort((a, b) => String(b.decided_at).localeCompare(String(a.decided_at)))[0];
+}
+
+function queueRowForClaim(claim, caseRow, latestOutcome) {
+  return {
+    case_id: caseRow.id,
+    claim_id: claim.id,
+    claim_number: claim.claim_number || null,
+    policy_number: claim.policy_number || null,
+    claimant_name: claim.claimant_name || null,
+    incident_date: claim.incident_date || null,
+    report_date: claim.report_date || null,
+    claim_amount: claim.claim_amount ?? null,
+    currency: claim.currency || 'USD',
+    risk_score: claim.risk_score ?? 0,
+    risk_band: claim.risk_band || 'low',
+    claim_status: claim.status || 'open',
+    case_status: caseRow.status || 'new',
+    priority: caseRow.priority || 0,
+    case_updated_at: caseRow.updated_at,
+    latest_outcome: latestOutcome ? latestOutcome.outcome : null,
+    latest_outcome_at: latestOutcome ? latestOutcome.decided_at : null
+  };
 }
 
 // PUBLIC_INTERFACE
 async function insertClaimWithCaseAndSignals({ claim, scoring }) {
-  /** Inserts claim, creates/updates case (1:1), and inserts fraud signals. Returns created claim id. */
-  const supabase = sb();
+  /** Inserts claim, creates/updates case (1:1), and inserts fraud signals. Returns created claim row. */
+  try {
+    const now = new Date().toISOString();
+    const id = uuid();
 
-  // Insert claim
-  const { data: claimRows, error: claimErr } = await supabase
-    .from('claims')
-    .insert([
-      {
-        ...claim,
-        risk_score: scoring.risk_score,
-        risk_band: scoring.risk_band,
-        status: 'open'
-      }
-    ])
-    .select('*');
+    const createdClaim = {
+      id,
+      claim_number: claim.claim_number ?? null,
+      policy_number: claim.policy_number ?? null,
+      claimant_name: claim.claimant_name ?? null,
+      claimant_email: claim.claimant_email ?? null,
+      claimant_phone: claim.claimant_phone ?? null,
 
-  if (claimErr) {
-    throw badRequest('Failed to insert claim', { supabase: claimErr.message });
-  }
+      // Persist as ISO date-only strings for consistent UI display.
+      incident_date: toIsoDateOnly(claim.incident_date),
+      report_date: toIsoDateOnly(claim.report_date),
 
-  const insertedClaim = claimRows[0];
+      claim_amount: claim.claim_amount ?? null,
+      currency: claim.currency || 'USD',
+      incident_state: claim.incident_state ?? null,
+      incident_city: claim.incident_city ?? null,
 
-  // Upsert case 1:1
-  const priority = scoring.risk_band === 'high' ? 3 : scoring.risk_band === 'medium' ? 1 : 0;
-  const { error: caseErr } = await supabase
-    .from('cases')
-    .upsert(
-      [
-        {
-          claim_id: insertedClaim.id,
-          status: 'new',
-          priority,
-          risk_score_snapshot: scoring.risk_score,
-          risk_band_snapshot: scoring.risk_band,
-          title: insertedClaim.claim_number
-            ? `Claim ${insertedClaim.claim_number}`
-            : `Claim ${insertedClaim.id.slice(0, 8)}`,
-          description: null
-        }
-      ],
-      { onConflict: 'claim_id' }
-    );
+      source_file_name: claim.source_file_name ?? null,
+      source_row_number: claim.source_row_number ?? null,
 
-  if (caseErr) {
-    throw badRequest('Failed to upsert case for claim', { supabase: caseErr.message });
-  }
+      risk_score: scoring.risk_score,
+      risk_band: scoring.risk_band,
+      status: 'open',
 
-  // Insert signals
-  if (scoring.signals && scoring.signals.length) {
-    const payload = scoring.signals.map((s) => ({
-      claim_id: insertedClaim.id,
-      ...s
+      created_at: now,
+      updated_at: now
+    };
+
+    claimsById.set(id, createdClaim);
+
+    const priority = computePriority(scoring.risk_band);
+    const createdCase = {
+      id: uuid(),
+      claim_id: id,
+      status: 'new',
+      priority,
+      risk_score_snapshot: scoring.risk_score,
+      risk_band_snapshot: scoring.risk_band,
+      title: createdClaim.claim_number ? `Claim ${createdClaim.claim_number}` : `Claim ${id.slice(0, 8)}`,
+      description: null,
+      created_at: now,
+      updated_at: now
+    };
+    casesByClaimId.set(id, createdCase);
+
+    const sigs = (scoring.signals || []).map((s) => ({
+      id: uuid(),
+      claim_id: id,
+      signal_code: s.signal_code,
+      signal_name: s.signal_name,
+      severity: s.severity,
+      weight: s.weight,
+      description: s.description || null,
+      evidence: s.evidence || {},
+      created_at: now
     }));
+    signalsByClaimId.set(id, sigs);
 
-    const { error: sigErr } = await supabase.from('fraud_signals').insert(payload);
-    if (sigErr) {
-      throw badRequest('Failed to insert fraud signals', { supabase: sigErr.message });
-    }
+    outcomesByClaimId.set(id, outcomesByClaimId.get(id) || []);
+
+    return createdClaim;
+  } catch (e) {
+    throw badRequest('Failed to insert claim (in-memory store)', { error: e?.message || String(e) });
   }
-
-  return mapClaimRow(insertedClaim);
 }
 
 // PUBLIC_INTERFACE
 async function listClaims({ limit, offset, risk_band, status, claim_number }) {
-  /** Lists claims with optional filters; returns {items, total}. */
-  const supabase = sb();
+  /** Lists claims with optional filters; returns {items, total, limit, offset}. */
+  const lim = limit || 50;
+  const off = offset || 0;
 
-  let query = supabase.from('claims').select('*', { count: 'exact' }).order('created_at', { ascending: false });
+  let items = Array.from(claimsById.values());
 
-  if (risk_band) query = query.eq('risk_band', risk_band);
-  if (status) query = query.eq('status', status);
-  if (claim_number) query = query.ilike('claim_number', `%${claim_number}%`);
+  // Newest first
+  items.sort((a, b) => String(b.created_at).localeCompare(String(a.created_at)));
 
-  const from = offset || 0;
-  const to = from + (limit || 50) - 1;
-
-  const { data, error, count } = await query.range(from, to);
-  if (error) {
-    throw badRequest('Failed to list claims', { supabase: error.message });
+  if (risk_band) items = items.filter((c) => c.risk_band === risk_band);
+  if (status) items = items.filter((c) => c.status === status);
+  if (claim_number) {
+    const q = String(claim_number).toLowerCase();
+    items = items.filter((c) => String(c.claim_number || '').toLowerCase().includes(q));
   }
 
-  const items = (data || []).map((row) => {
-    // risk_score is stored as 0..1 in the DB. Some frontends/filters use 0..100 semantics.
-    // Provide both, so UI can reliably filter "score > 60" using risk_score_pct.
-    const raw = row && row.risk_score !== undefined && row.risk_score !== null ? Number(row.risk_score) : null;
-    const risk_score_pct = raw === null || Number.isNaN(raw) ? null : Math.round(raw * 100);
-    return { ...row, risk_score_pct };
-  });
+  const total = items.length;
+  const paged = items.slice(off, off + lim).map(withRiskPct);
 
-  return { items, total: count || 0, limit: limit || 50, offset: offset || 0 };
+  return { items: paged, total, limit: lim, offset: off };
 }
 
 // PUBLIC_INTERFACE
 async function getClaimDetail(claimId) {
   /** Gets claim + signals + latest outcome and case row. */
-  const supabase = sb();
+  const claim = claimsById.get(claimId);
+  if (!claim) throw notFound('Claim not found');
 
-  const { data: claimRows, error: claimErr } = await supabase.from('claims').select('*').eq('id', claimId).limit(1);
-  if (claimErr) throw badRequest('Failed to fetch claim', { supabase: claimErr.message });
-  if (!claimRows || !claimRows.length) throw notFound('Claim not found');
+  const signals = signalsByClaimId.get(claimId) || [];
+  const caseRow = casesByClaimId.get(claimId) || null;
+  const latest_outcome = latestOutcomeForClaim(claimId);
 
-  const claim = claimRows[0];
-
-  const { data: signals, error: sigErr } = await supabase
-    .from('fraud_signals')
-    .select('*')
-    .eq('claim_id', claimId)
-    .order('severity', { ascending: false })
-    .order('created_at', { ascending: true });
-
-  if (sigErr) throw badRequest('Failed to fetch fraud signals', { supabase: sigErr.message });
-
-  const { data: caseRows, error: caseErr } = await supabase.from('cases').select('*').eq('claim_id', claimId).limit(1);
-  if (caseErr) throw badRequest('Failed to fetch case', { supabase: caseErr.message });
-
-  const { data: outcomes, error: outErr } = await supabase
-    .from('outcomes')
-    .select('*')
-    .eq('claim_id', claimId)
-    .order('decided_at', { ascending: false })
-    .limit(1);
-
-  if (outErr) throw badRequest('Failed to fetch outcomes', { supabase: outErr.message });
+  const sortedSignals = [...signals].sort((a, b) => {
+    if (b.severity !== a.severity) return b.severity - a.severity;
+    return String(a.created_at).localeCompare(String(b.created_at));
+  });
 
   return {
-    claim,
-    case: (caseRows && caseRows[0]) || null,
-    signals: signals || [],
-    latest_outcome: (outcomes && outcomes[0]) || null
+    claim: withRiskPct(claim),
+    case: caseRow,
+    signals: sortedSignals,
+    latest_outcome
   };
 }
 
 // PUBLIC_INTERFACE
 async function createOutcomeForClaim(claimId, outcomeBody) {
   /** Creates an outcome record for a claim, linked to its case if exists. */
-  const supabase = sb();
+  const claim = claimsById.get(claimId);
+  if (!claim) throw notFound('Claim not found');
 
-  const { data: caseRows, error: caseErr } = await supabase.from('cases').select('id').eq('claim_id', claimId).limit(1);
-  if (caseErr) throw badRequest('Failed to resolve case for claim', { supabase: caseErr.message });
+  const caseRow = casesByClaimId.get(claimId) || null;
+  const now = new Date().toISOString();
 
-  const caseId = caseRows && caseRows[0] ? caseRows[0].id : null;
+  const outcome = {
+    id: uuid(),
+    claim_id: claimId,
+    case_id: caseRow ? caseRow.id : null,
+    outcome: outcomeBody.outcome,
+    notes: outcomeBody.notes || null,
+    decided_by: outcomeBody.decided_by || null,
+    decided_at: toIsoDateTime(now),
+    created_at: toIsoDateTime(now)
+  };
 
-  const { data: outRows, error: outErr } = await supabase
-    .from('outcomes')
-    .insert([
-      {
-        claim_id: claimId,
-        case_id: caseId,
-        outcome: outcomeBody.outcome,
-        notes: outcomeBody.notes || null,
-        decided_by: outcomeBody.decided_by || null
-      }
-    ])
-    .select('*');
+  const history = outcomesByClaimId.get(claimId) || [];
+  history.push(outcome);
+  outcomesByClaimId.set(claimId, history);
 
-  if (outErr) throw badRequest('Failed to create outcome', { supabase: outErr.message });
-
-  // Optionally close claim on legit/no_action/fraud_confirmed (simple MVP).
+  // Close claim on legit/no_action/fraud_confirmed (simple MVP).
   const shouldClose = ['legit', 'no_action', 'fraud_confirmed'].includes(outcomeBody.outcome);
   if (shouldClose) {
-    const { error: updErr } = await supabase.from('claims').update({ status: 'closed' }).eq('id', claimId);
-    if (updErr) {
-      // Non-fatal; return outcome anyway.
-      // eslint-disable-next-line no-console
-      console.warn('Failed to update claim status:', updErr.message);
-    }
+    claimsById.set(claimId, { ...claim, status: 'closed', updated_at: now });
   }
 
-  return outRows[0];
+  // Touch case for queue ordering freshness.
+  if (caseRow) {
+    casesByClaimId.set(claimId, { ...caseRow, updated_at: now });
+  }
+
+  return outcome;
 }
 
 // PUBLIC_INTERFACE
 async function getQueue({ limit, offset }) {
-  /** Returns queue rows from v_queue. */
-  const supabase = sb();
-  const from = offset || 0;
-  const to = from + (limit || 50) - 1;
+  /** Returns queue rows derived from in-memory claims/cases/outcomes. */
+  const lim = limit || 50;
+  const off = offset || 0;
 
-  // v_queue is defined in Supabase schema (assets/supabase.md). In the authoritative schema,
-  // the case table has `risk_score_snapshot` and the view exposes many claim/case fields.
-  //
-  // In real deployments, view columns can drift (e.g., risk score column names), and ordering
-  // by a missing column causes PostgREST/Supabase to return an error.
-  //
-  // To keep the queue endpoint resilient and restore Dashboard/Queue, we:
-  // 1) Prefer ordering by `risk_score_snapshot` (case snapshot), which is the intended queue metric.
-  // 2) Fall back to `risk_score` if the view doesn't expose `risk_score_snapshot`.
-  let query = supabase
-    .from('v_queue')
-    .select('*', { count: 'exact' })
-    .order('case_status', { ascending: true })
-    .order('priority', { ascending: false });
+  const rows = [];
 
-  let resp = await query
-    .order('risk_score_snapshot', { ascending: false })
-    .order('case_updated_at', { ascending: false })
-    .range(from, to);
-
-  // Fallback for older/alternate v_queue definitions.
-  if (resp.error && /risk_score_snapshot/i.test(resp.error.message || '')) {
-    resp = await query
-      .order('risk_score', { ascending: false })
-      .order('case_updated_at', { ascending: false })
-      .range(from, to);
+  for (const claim of claimsById.values()) {
+    const caseRow = casesByClaimId.get(claim.id);
+    if (!caseRow) continue;
+    const lo = latestOutcomeForClaim(claim.id);
+    rows.push(queueRowForClaim(withRiskPct(claim), caseRow, lo));
   }
 
-  const { data, error, count } = resp;
+  // Order similar to intended Supabase view ordering.
+  rows.sort((a, b) => {
+    const cs = String(a.case_status).localeCompare(String(b.case_status));
+    if (cs !== 0) return cs;
 
-  if (error) throw badRequest('Failed to fetch queue', { supabase: error.message });
+    if (Number(b.priority) !== Number(a.priority)) return Number(b.priority) - Number(a.priority);
 
-  return { items: data || [], total: count || 0, limit: limit || 50, offset: offset || 0 };
+    const ra = Number(a.risk_score ?? 0);
+    const rb = Number(b.risk_score ?? 0);
+    if (rb !== ra) return rb - ra;
+
+    return String(b.case_updated_at).localeCompare(String(a.case_updated_at));
+  });
+
+  const total = rows.length;
+  const paged = rows.slice(off, off + lim);
+
+  return { items: paged, total, limit: lim, offset: off };
 }
 
 // PUBLIC_INTERFACE
 async function getReportsSummary() {
-  /** Returns a single row from v_reports_summary. If DB is empty, returns a stable all-zeros object. */
-  const supabase = sb();
-  const { data, error } = await supabase.from('v_reports_summary').select('*').limit(1);
-  if (error) throw badRequest('Failed to fetch reports summary', { supabase: error.message });
+  /** Returns dashboard summary counts computed from in-memory store. */
+  const generated_at = new Date().toISOString();
+  const claims = Array.from(claimsById.values());
 
-  // v_reports_summary always returns 1 row in the authoritative schema (it's an aggregate view).
-  // However, in some deployments it may return no rows; treat that as "empty DB", not an error.
-  const row = (data && data[0]) || null;
-  if (row) return row;
+  const total_claims = claims.length;
+  const high_risk_claims = claims.filter((c) => c.risk_band === 'high').length;
+  const medium_risk_claims = claims.filter((c) => c.risk_band === 'medium').length;
+  const low_risk_claims = claims.filter((c) => c.risk_band === 'low').length;
+  const open_claims = claims.filter((c) => c.status === 'open').length;
+
+  const latest = claims.map((c) => latestOutcomeForClaim(c.id)).filter(Boolean);
+  const countOutcome = (o) => latest.filter((x) => x.outcome === o).length;
 
   return {
-    generated_at: new Date().toISOString(),
-    total_claims: 0,
-    high_risk_claims: 0,
-    medium_risk_claims: 0,
-    low_risk_claims: 0,
-    open_claims: 0,
-    fraud_confirmed: 0,
-    fraud_suspected: 0,
-    legit: 0,
-    needs_more_info: 0,
-    no_action: 0
+    generated_at,
+    total_claims,
+    high_risk_claims,
+    medium_risk_claims,
+    low_risk_claims,
+    open_claims,
+    fraud_confirmed: countOutcome('fraud_confirmed'),
+    fraud_suspected: countOutcome('fraud_suspected'),
+    legit: countOutcome('legit'),
+    needs_more_info: countOutcome('needs_more_info'),
+    no_action: countOutcome('no_action')
   };
 }
 

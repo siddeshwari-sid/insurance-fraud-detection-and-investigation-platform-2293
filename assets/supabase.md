@@ -16,15 +16,18 @@ It is designed to be:
 
 ---
 
-## 0) Required for automated tooling (Kavia SupabaseTools)
+## Status: Tool-based SQL execution (Kavia SupabaseTools)
 
-The automation tools used in this repo expect a Postgres function `public.run_sql(query text)` to exist and be callable.  
-If it is missing, you may see errors like:
+As of the latest verification, SupabaseTools calls (`list_tables`, `create_table`, `run_sql`) are **still failing** with:
 
 - `PGRST202 Could not find the function public.run_sql(query) in the schema cache`
 
-### 0.1 Create `public.run_sql` (admin-only)
+This indicates that **either**:
+1) `public.run_sql(query text)` was not created in the connected Supabase project, **or**
+2) it was created but the **PostgREST schema cache has not refreshed**, **or**
+3) it was created with a different signature/name/schema than expected (`public.run_sql(query text)`).
 
+### Fix: Create/replace `public.run_sql` (admin-only)
 Run this in **Supabase SQL Editor** (requires project owner/admin):
 
 ```sql
@@ -44,25 +47,50 @@ revoke all on function public.run_sql(text) from public;
 grant execute on function public.run_sql(text) to service_role;
 ```
 
-After adding it, re-open the SQL editor (or wait briefly) so the API schema cache refreshes.
+### After creating it
+- Wait ~30–60 seconds for the API schema cache to refresh, or reload the Supabase dashboard.
+- Then re-run the automation step (tools should succeed).
 
 ---
 
-## 0.2 Required Supabase secrets / environment variables (Express backend)
+## Required Supabase environment variables (Express backend)
 
-The backend reads the following env vars (see `express_backend/.env.example`):
+The Express backend Supabase client is implemented in:
 
-- `SUPABASE_URL` (Supabase project URL)
-- `SUPABASE_SERVICE_ROLE_KEY` (Service Role key; keep server-side only)
+- `insurance-fraud-detection-and-investigation-platform-2293/express_backend/src/db/supabase.js`
 
-**Where to set:**
-- In Supabase Dashboard (recommended for deployed environments):  
-  `Project Settings -> API` for values, and store them in your deployment secrets.
-- Locally: create `express_backend/.env` with these values.
+It expects **exactly** these server-side environment variables:
 
-**Important:**
-- Never expose `SUPABASE_SERVICE_ROLE_KEY` to the frontend.
-- Service role bypasses RLS; use it only in trusted backend services.
+- `SUPABASE_URL` — Supabase project URL (e.g. `https://<ref>.supabase.co`)
+- `SUPABASE_SERVICE_ROLE_KEY` — **Service Role key** (server-side only)
+
+These names are also reflected in:
+
+- `insurance-fraud-detection-and-investigation-platform-2293/express_backend/.env.example`
+
+### Important: anon key vs service role key
+- The backend **does not** use `SUPABASE_KEY`.
+- `SUPABASE_KEY` is typically the **anon** public key and is safe for frontend usage, but **not sufficient** for backend operations that need to bypass RLS.
+- Do **not** set `SUPABASE_SERVICE_ROLE_KEY` to the anon key value.
+
+### Where to find the values in Supabase
+In Supabase Dashboard:
+- **Project Settings → API**
+  - `Project URL` → use as `SUPABASE_URL`
+  - `service_role` key → use as `SUPABASE_SERVICE_ROLE_KEY`
+  - `anon` key → frontend only (if you add a frontend Supabase client)
+
+### Local dev
+Create/update:
+
+- `insurance-fraud-detection-and-investigation-platform-2293/express_backend/.env`
+
+with:
+
+```bash
+SUPABASE_URL=...
+SUPABASE_SERVICE_ROLE_KEY=...
+```
 
 ---
 

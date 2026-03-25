@@ -9,14 +9,31 @@ const { toErrorResponse } = require('./middleware/errors');
 const app = express();
 
 // CORS configuration:
-// - If FRONTEND_ORIGIN is set (recommended), only allow that origin.
-// - Otherwise fall back to permissive "*" (useful in dev).
+// - Set FRONTEND_ORIGIN to a single origin or a comma-separated allowlist.
+//   Example: FRONTEND_ORIGIN=https://myapp.com,https://staging.myapp.com
+// - If not set, default to reflecting the request origin (dev-friendly).
 const frontendOrigin = process.env.FRONTEND_ORIGIN;
+
+const allowedOrigins = (frontendOrigin || "")
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
+
 app.use(
   cors({
-    origin: frontendOrigin || '*',
-    methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization']
+    origin: (origin, cb) => {
+      // Non-browser clients (no Origin) should be allowed.
+      if (!origin) return cb(null, true);
+
+      // If no explicit allowlist, reflect origin (useful for dev/previews).
+      if (allowedOrigins.length === 0) return cb(null, true);
+
+      if (allowedOrigins.includes(origin)) return cb(null, true);
+
+      return cb(new Error(`CORS blocked for origin: ${origin}`), false);
+    },
+    methods: ["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "Authorization"]
   })
 );
 

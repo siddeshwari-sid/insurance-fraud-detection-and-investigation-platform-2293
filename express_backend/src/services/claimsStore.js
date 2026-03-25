@@ -93,7 +93,15 @@ async function listClaims({ limit, offset, risk_band, status, claim_number }) {
     throw badRequest('Failed to list claims', { supabase: error.message });
   }
 
-  return { items: data || [], total: count || 0, limit: limit || 50, offset: offset || 0 };
+  const items = (data || []).map((row) => {
+    // risk_score is stored as 0..1 in the DB. Some frontends/filters use 0..100 semantics.
+    // Provide both, so UI can reliably filter "score > 60" using risk_score_pct.
+    const raw = row && row.risk_score !== undefined && row.risk_score !== null ? Number(row.risk_score) : null;
+    const risk_score_pct = raw === null || Number.isNaN(raw) ? null : Math.round(raw * 100);
+    return { ...row, risk_score_pct };
+  });
+
+  return { items, total: count || 0, limit: limit || 50, offset: offset || 0 };
 }
 
 // PUBLIC_INTERFACE
@@ -219,11 +227,29 @@ async function getQueue({ limit, offset }) {
 
 // PUBLIC_INTERFACE
 async function getReportsSummary() {
-  /** Returns a single row from v_reports_summary. */
+  /** Returns a single row from v_reports_summary. If DB is empty, returns a stable all-zeros object. */
   const supabase = sb();
   const { data, error } = await supabase.from('v_reports_summary').select('*').limit(1);
   if (error) throw badRequest('Failed to fetch reports summary', { supabase: error.message });
-  return (data && data[0]) || null;
+
+  // v_reports_summary always returns 1 row in the authoritative schema (it's an aggregate view).
+  // However, in some deployments it may return no rows; treat that as "empty DB", not an error.
+  const row = (data && data[0]) || null;
+  if (row) return row;
+
+  return {
+    generated_at: new Date().toISOString(),
+    total_claims: 0,
+    high_risk_claims: 0,
+    medium_risk_claims: 0,
+    low_risk_claims: 0,
+    open_claims: 0,
+    fraud_confirmed: 0,
+    fraud_suspected: 0,
+    legit: 0,
+    needs_more_info: 0,
+    no_action: 0
+  };
 }
 
 module.exports = {

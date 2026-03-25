@@ -50,6 +50,7 @@ class ClaimsController {
         message: 'Claims uploaded successfully',
         data: {
           source_file_name: sourceFileName,
+          inserted_count: created.length,
           ingested_count: created.length,
           items: created
         }

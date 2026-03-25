@@ -182,14 +182,35 @@ async function getQueue({ limit, offset }) {
   const from = offset || 0;
   const to = from + (limit || 50) - 1;
 
-  const { data, error, count } = await supabase
+  // v_queue is defined in Supabase schema (assets/supabase.md). In the authoritative schema,
+  // the case table has `risk_score_snapshot` and the view exposes many claim/case fields.
+  //
+  // In real deployments, view columns can drift (e.g., risk score column names), and ordering
+  // by a missing column causes PostgREST/Supabase to return an error.
+  //
+  // To keep the queue endpoint resilient and restore Dashboard/Queue, we:
+  // 1) Prefer ordering by `risk_score_snapshot` (case snapshot), which is the intended queue metric.
+  // 2) Fall back to `risk_score` if the view doesn't expose `risk_score_snapshot`.
+  let query = supabase
     .from('v_queue')
     .select('*', { count: 'exact' })
     .order('case_status', { ascending: true })
-    .order('priority', { ascending: false })
-    .order('risk_score', { ascending: false })
+    .order('priority', { ascending: false });
+
+  let resp = await query
+    .order('risk_score_snapshot', { ascending: false })
     .order('case_updated_at', { ascending: false })
     .range(from, to);
+
+  // Fallback for older/alternate v_queue definitions.
+  if (resp.error && /risk_score_snapshot/i.test(resp.error.message || '')) {
+    resp = await query
+      .order('risk_score', { ascending: false })
+      .order('case_updated_at', { ascending: false })
+      .range(from, to);
+  }
+
+  const { data, error, count } = resp;
 
   if (error) throw badRequest('Failed to fetch queue', { supabase: error.message });
 

@@ -1,4 +1,5 @@
 const { createClient } = require('@supabase/supabase-js');
+const { ConfigError } = require('../middleware/errors');
 
 /**
  * Creates a Supabase client using service-role key (recommended for backend writes).
@@ -11,9 +12,15 @@ function createSupabaseServiceClient() {
   const serviceRoleKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
 
   if (!url || !serviceRoleKey) {
-    // Intentionally throw so startup/requests fail loudly with actionable info.
-    throw new Error(
-      'Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY env vars. Please set them in the backend .env.'
+    const missing = [];
+    if (!url) missing.push('SUPABASE_URL');
+    if (!serviceRoleKey) missing.push('SUPABASE_SERVICE_ROLE_KEY');
+
+    // Intentionally throw so requests fail loudly with actionable info,
+    // but keep it structured so middleware can turn it into a 503.
+    throw new ConfigError(
+      'Backend is missing required Supabase configuration. Set SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY.',
+      { missing_env: missing }
     );
   }
 

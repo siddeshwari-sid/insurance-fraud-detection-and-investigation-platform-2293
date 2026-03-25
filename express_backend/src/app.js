@@ -14,8 +14,8 @@ const app = express();
 // - If not set, default to reflecting the request origin (dev-friendly).
 const frontendOrigin = process.env.FRONTEND_ORIGIN;
 
-const allowedOrigins = (frontendOrigin || "")
-  .split(",")
+const allowedOrigins = (frontendOrigin || '')
+  .split(',')
   .map((s) => s.trim())
   .filter(Boolean);
 
@@ -32,8 +32,8 @@ app.use(
 
       return cb(new Error(`CORS blocked for origin: ${origin}`), false);
     },
-    methods: ["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"],
-    allowedHeaders: ["Content-Type", "Authorization"]
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization']
   })
 );
 
@@ -71,7 +71,6 @@ app.use('/', routes);
 
 // Error handling middleware (last)
 app.use((err, req, res, next) => {
-  // eslint-disable-next-line no-console
   console.error(err);
   const { statusCode, body } = toErrorResponse(err);
   res.status(statusCode).json(body);

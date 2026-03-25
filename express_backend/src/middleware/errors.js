@@ -8,6 +8,14 @@ class ApiError extends Error {
   }
 }
 
+class ConfigError extends Error {
+  constructor(message, details) {
+    super(message);
+    this.name = 'ConfigError';
+    this.details = details || null;
+  }
+}
+
 // PUBLIC_INTERFACE
 function notFound(message) {
   /** Creates a 404 error. */
@@ -18,6 +26,12 @@ function notFound(message) {
 function badRequest(message, details) {
   /** Creates a 400 error. */
   return new ApiError(400, message || 'Bad request', details);
+}
+
+// PUBLIC_INTERFACE
+function serviceUnavailable(message, details) {
+  /** Creates a 503 error (useful for missing configuration or unavailable dependencies). */
+  return new ApiError(503, message || 'Service unavailable', details);
 }
 
 // PUBLIC_INTERFACE
@@ -48,6 +62,29 @@ function toErrorResponse(err) {
     };
   }
 
+  // Treat missing env / configuration as a dependency error, not a generic 500.
+  if (err && (err.name === 'ConfigError' || /Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY/.test(err.message || ''))) {
+    return {
+      statusCode: 503,
+      body: {
+        status: 'error',
+        message: err.message || 'Service configuration missing',
+        details: err.details || null
+      }
+    };
+  }
+
+  // CORS blocks should be explicit for easier debugging.
+  if (err && typeof err.message === 'string' && err.message.startsWith('CORS blocked for origin:')) {
+    return {
+      statusCode: 403,
+      body: {
+        status: 'error',
+        message: err.message
+      }
+    };
+  }
+
   return {
     statusCode: 500,
     body: {
@@ -59,7 +96,9 @@ function toErrorResponse(err) {
 
 module.exports = {
   ApiError,
+  ConfigError,
   notFound,
   badRequest,
+  serviceUnavailable,
   toErrorResponse
 };

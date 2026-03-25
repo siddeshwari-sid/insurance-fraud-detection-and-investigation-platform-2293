@@ -18,16 +18,14 @@ It is designed to be:
 
 ## Status: Tool-based SQL execution (Kavia SupabaseTools)
 
+### Current verification result
 As of the latest verification, SupabaseTools calls (`list_tables`, `create_table`, `run_sql`) are **still failing** with:
 
 - `PGRST202 Could not find the function public.run_sql(query) in the schema cache`
 
-This indicates that **either**:
-1) `public.run_sql(query text)` was not created in the connected Supabase project, **or**
-2) it was created but the **PostgREST schema cache has not refreshed**, **or**
-3) it was created with a different signature/name/schema than expected (`public.run_sql(query text)`).
+This means **PostgREST (the Supabase REST API layer) is not advertising** `public.run_sql(query text)` yet (either it doesn’t exist, exists under a different signature, or the schema cache hasn’t refreshed).
 
-### Fix: Create/replace `public.run_sql` (admin-only)
+### Fix: Create/replace `public.run_sql` exactly as expected (admin-only)
 Run this in **Supabase SQL Editor** (requires project owner/admin):
 
 ```sql
@@ -47,9 +45,33 @@ revoke all on function public.run_sql(text) from public;
 grant execute on function public.run_sql(text) to service_role;
 ```
 
-### After creating it
-- Wait ~30–60 seconds for the API schema cache to refresh, or reload the Supabase dashboard.
-- Then re-run the automation step (tools should succeed).
+### Verify the function exists (in SQL editor)
+Run:
+
+```sql
+select
+  n.nspname as schema,
+  p.proname as name,
+  pg_get_function_identity_arguments(p.oid) as args
+from pg_proc p
+join pg_namespace n on n.oid = p.pronamespace
+where n.nspname = 'public' and p.proname = 'run_sql';
+```
+
+Expected: one row with args exactly `query text`.
+
+### Make PostgREST pick up changes
+After creating it:
+
+- Wait ~30–60 seconds for the API schema cache to refresh, OR
+- In Supabase Dashboard: **Settings → API → “Reload schema”** (or similar “refresh” action, depending on dashboard version)
+
+Then re-run automation; SupabaseTools should be able to:
+- list tables
+- create missing tables
+- apply triggers/indexes/views/RLS via SQL
+
+If it still fails after refresh, double-check there isn’t another `run_sql` function in a different schema and that the signature is **exactly** `(query text)`.
 
 ---
 
@@ -63,6 +85,19 @@ It expects **exactly** these server-side environment variables:
 
 - `SUPABASE_URL` — Supabase project URL (e.g. `https://<ref>.supabase.co`)
 - `SUPABASE_SERVICE_ROLE_KEY` — **Service Role key** (server-side only)
+
+### Important: these are currently missing in this runtime/container
+The current container environment only includes `REACT_APP_*` variables (frontend-style).  
+For end-to-end backend verification to work, you must add the following to:
+
+- `insurance-fraud-detection-and-investigation-platform-2293/express_backend/.env`
+
+```bash
+SUPABASE_URL=...
+SUPABASE_SERVICE_ROLE_KEY=...
+```
+
+Without these, the Express backend cannot connect to Supabase.
 
 These names are also reflected in:
 

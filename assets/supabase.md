@@ -16,6 +16,56 @@ It is designed to be:
 
 ---
 
+## 0) Required for automated tooling (Kavia SupabaseTools)
+
+The automation tools used in this repo expect a Postgres function `public.run_sql(query text)` to exist and be callable.  
+If it is missing, you may see errors like:
+
+- `PGRST202 Could not find the function public.run_sql(query) in the schema cache`
+
+### 0.1 Create `public.run_sql` (admin-only)
+
+Run this in **Supabase SQL Editor** (requires project owner/admin):
+
+```sql
+-- Enables Kavia automation to execute SQL via an RPC.
+-- Security note: this function is intentionally locked down to service_role.
+create or replace function public.run_sql(query text)
+returns void
+language plpgsql
+security definer
+as $$
+begin
+  execute query;
+end;
+$$;
+
+revoke all on function public.run_sql(text) from public;
+grant execute on function public.run_sql(text) to service_role;
+```
+
+After adding it, re-open the SQL editor (or wait briefly) so the API schema cache refreshes.
+
+---
+
+## 0.2 Required Supabase secrets / environment variables (Express backend)
+
+The backend reads the following env vars (see `express_backend/.env.example`):
+
+- `SUPABASE_URL` (Supabase project URL)
+- `SUPABASE_SERVICE_ROLE_KEY` (Service Role key; keep server-side only)
+
+**Where to set:**
+- In Supabase Dashboard (recommended for deployed environments):  
+  `Project Settings -> API` for values, and store them in your deployment secrets.
+- Locally: create `express_backend/.env` with these values.
+
+**Important:**
+- Never expose `SUPABASE_SERVICE_ROLE_KEY` to the frontend.
+- Service role bypasses RLS; use it only in trusted backend services.
+
+---
+
 ## 1) Extensions
 
 ```sql

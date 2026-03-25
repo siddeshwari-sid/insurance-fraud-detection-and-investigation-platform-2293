@@ -18,15 +18,23 @@ It is designed to be:
 
 ## Status: Tool-based SQL execution (Kavia SupabaseTools)
 
-### Current verification result
-As of the latest verification, SupabaseTools calls (`list_tables`, `create_table`, `run_sql`) are **still failing** with:
+### Current verification result (latest)
+Even after confirming in SQL that **a** `public.run_sql` function exists, SupabaseTools are **still failing**:
 
 - `PGRST202 Could not find the function public.run_sql(query) in the schema cache`
 
-This means **PostgREST (the Supabase REST API layer) is not advertising** `public.run_sql(query text)` yet (either it doesn’t exist, exists under a different signature, or the schema cache hasn’t refreshed).
+This happened for all of:
+- `SupabaseTool_list_tables`
+- `SupabaseTool_create_table`
+- `SupabaseTool_run_sql`
 
-### Fix: Create/replace `public.run_sql` exactly as expected (admin-only)
-Run this in **Supabase SQL Editor** (requires project owner/admin):
+**What this means**
+- PostgREST (Supabase REST layer) still does **not** advertise an RPC matching **exactly**:
+  - `public.run_sql(query text)` (named arg `query`, type `text`)
+- Your dashboard query showing `public.run_sql(sql text)` indicates the function signature currently visible in Postgres is **not an exact match** to what SupabaseTools is trying to call, OR PostgREST has not refreshed its schema cache, OR the function is not exposed to the API role expected by PostgREST.
+
+### Required fix (admin-only): create/replace `public.run_sql(query text)` EXACTLY
+Run this in **Supabase SQL Editor** (project owner/admin):
 
 ```sql
 -- Enables Kavia automation to execute SQL via an RPC.
@@ -45,7 +53,7 @@ revoke all on function public.run_sql(text) from public;
 grant execute on function public.run_sql(text) to service_role;
 ```
 
-### Verify the function exists (in SQL editor)
+### Verify (in SQL editor) the identity args are EXACTLY `query text`
 Run:
 
 ```sql
@@ -60,18 +68,12 @@ where n.nspname = 'public' and p.proname = 'run_sql';
 
 Expected: one row with args exactly `query text`.
 
-### Make PostgREST pick up changes
-After creating it:
-
+### Force PostgREST to pick up changes
+After creating/replacing it:
 - Wait ~30–60 seconds for the API schema cache to refresh, OR
-- In Supabase Dashboard: **Settings → API → “Reload schema”** (or similar “refresh” action, depending on dashboard version)
+- Supabase Dashboard → **Settings → API → Reload schema / Refresh API schema** (wording varies)
 
-Then re-run automation; SupabaseTools should be able to:
-- list tables
-- create missing tables
-- apply triggers/indexes/views/RLS via SQL
-
-If it still fails after refresh, double-check there isn’t another `run_sql` function in a different schema and that the signature is **exactly** `(query text)`.
+Then re-run SupabaseTools verification again (list_tables should start working).
 
 ---
 
@@ -81,23 +83,28 @@ The Express backend Supabase client is implemented in:
 
 - `insurance-fraud-detection-and-investigation-platform-2293/express_backend/src/db/supabase.js`
 
-It expects **exactly** these server-side environment variables:
+It expects **server-side** environment variables:
 
-- `SUPABASE_URL` — Supabase project URL (e.g. `https://<ref>.supabase.co`)
-- `SUPABASE_SERVICE_ROLE_KEY` — **Service Role key** (server-side only)
+- `SUPABASE_URL`
+- `SUPABASE_SERVICE_ROLE_KEY` (**service role**, server-only)
 
-### Important: these are currently missing in this runtime/container
-The current container environment only includes `REACT_APP_*` variables (frontend-style).  
-For end-to-end backend verification to work, you must add the following to:
+### Verification of current repo env file
+`insurance-fraud-detection-and-investigation-platform-2293/express_backend/.env` currently contains:
 
-- `insurance-fraud-detection-and-investigation-platform-2293/express_backend/.env`
+- ✅ `SUPABASE_URL=...`
+- ❌ `SUPABASE_SERVICE_ROLE_KEY` is **NOT present**
+- ⚠️ `SUPABASE_KEY=...` is present, but it is the **anon** key (role: `anon`) and is **not sufficient** for backend operations that rely on bypassing RLS.
+
+### Required manual step
+Add to `insurance-fraud-detection-and-investigation-platform-2293/express_backend/.env`:
 
 ```bash
-SUPABASE_URL=...
 SUPABASE_SERVICE_ROLE_KEY=...
 ```
 
-Without these, the Express backend cannot connect to Supabase.
+(Find it in Supabase Dashboard → Project Settings → API → `service_role` key.)
+
+Without `SUPABASE_SERVICE_ROLE_KEY`, the backend may still run for read-only anon-safe operations, but it will be blocked by RLS for typical ingest/write flows.
 
 These names are also reflected in:
 

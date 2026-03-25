@@ -19,26 +19,29 @@ It is designed to be:
 ## Status: Tool-based SQL execution (Kavia SupabaseTools)
 
 ### Current verification result (latest)
-Even after confirming in SQL that **a** `public.run_sql` function exists, SupabaseTools are **still failing**:
+✅ **`SupabaseTool_run_sql` is now working** via the user-created RPC wrapper `public.run_sql(query text)` (schema cache refreshed).
 
-- `PGRST202 Could not find the function public.run_sql(query) in the schema cache`
+Verified with:
+- `SupabaseTool_create_table` (created a harmless `_supabase_tools_ping` table successfully)
+- `SupabaseTool_run_sql` (executed `select 1;` successfully)
 
-This happened for all of:
-- `SupabaseTool_list_tables`
-- `SupabaseTool_create_table`
-- `SupabaseTool_run_sql`
+⚠️ **`SupabaseTool_list_tables` is still erroring**, but this now appears to be a *tool-side argument/serialization issue* rather than a Supabase/PostgREST schema-cache issue:
+- Error observed: `Invalid argument passed to SupabaseTool_list_tables: string indices must be integers, not 'str'`
 
-**What this means**
-- PostgREST (Supabase REST layer) still does **not** advertise an RPC matching **exactly**:
-  - `public.run_sql(query text)` (named arg `query`, type `text`)
-- Your dashboard query showing `public.run_sql(sql text)` indicates the function signature currently visible in Postgres is **not an exact match** to what SupabaseTools is trying to call, OR PostgREST has not refreshed its schema cache, OR the function is not exposed to the API role expected by PostgREST.
+**Impact**
+- We can still fully verify and manage schema using `SupabaseTool_run_sql` until `list_tables` is fixed.
 
-### Required fix (admin-only): create/replace `public.run_sql(query text)` EXACTLY
-Run this in **Supabase SQL Editor** (project owner/admin):
+### What was verified in Supabase (via `SupabaseTool_run_sql`)
+- ✅ `pgcrypto` extension exists (required for `gen_random_uuid()`)
+- ✅ Core tables exist: `claims`, `fraud_signals`, `cases`, `case_assignments`, `outcomes`
+- ✅ Enums exist: `case_status`, `outcome_status`, `assignment_role`
+- ✅ Views exist (reporting/queue): `v_claim_latest_outcome`, `v_queue`, `v_reports_summary`
+- ✅ RLS is enabled on core tables, and policies exist (as defined in this file)
+
+### Required RPC wrapper (keep as-is)
+The following function must exist exactly (already done by user):
 
 ```sql
--- Enables Kavia automation to execute SQL via an RPC.
--- Security note: this function is intentionally locked down to service_role.
 create or replace function public.run_sql(query text)
 returns void
 language plpgsql
@@ -52,28 +55,6 @@ $$;
 revoke all on function public.run_sql(text) from public;
 grant execute on function public.run_sql(text) to service_role;
 ```
-
-### Verify (in SQL editor) the identity args are EXACTLY `query text`
-Run:
-
-```sql
-select
-  n.nspname as schema,
-  p.proname as name,
-  pg_get_function_identity_arguments(p.oid) as args
-from pg_proc p
-join pg_namespace n on n.oid = p.pronamespace
-where n.nspname = 'public' and p.proname = 'run_sql';
-```
-
-Expected: one row with args exactly `query text`.
-
-### Force PostgREST to pick up changes
-After creating/replacing it:
-- Wait ~30–60 seconds for the API schema cache to refresh, OR
-- Supabase Dashboard → **Settings → API → Reload schema / Refresh API schema** (wording varies)
-
-Then re-run SupabaseTools verification again (list_tables should start working).
 
 ---
 
@@ -95,7 +76,16 @@ It expects **server-side** environment variables:
 - ❌ `SUPABASE_SERVICE_ROLE_KEY` is **NOT present**
 - ⚠️ `SUPABASE_KEY=...` is present, but it is the **anon** key (role: `anon`) and is **not sufficient** for backend operations that rely on bypassing RLS.
 
-### Required manual step
+Additionally, the backend code at:
+- `insurance-fraud-detection-and-investigation-platform-2293/express_backend/src/db/supabase.js`
+
+**explicitly requires**:
+- `SUPABASE_URL`
+- `SUPABASE_SERVICE_ROLE_KEY`
+
+…and will throw at runtime if either is missing.
+
+### Required manual step (still pending)
 Add to `insurance-fraud-detection-and-investigation-platform-2293/express_backend/.env`:
 
 ```bash
@@ -104,7 +94,7 @@ SUPABASE_SERVICE_ROLE_KEY=...
 
 (Find it in Supabase Dashboard → Project Settings → API → `service_role` key.)
 
-Without `SUPABASE_SERVICE_ROLE_KEY`, the backend may still run for read-only anon-safe operations, but it will be blocked by RLS for typical ingest/write flows.
+Without `SUPABASE_SERVICE_ROLE_KEY`, the backend may start but any Supabase-backed writes/updates (and even some reads depending on RLS/policies) will fail.
 
 These names are also reflected in:
 
